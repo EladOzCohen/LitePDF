@@ -1,0 +1,8 @@
+# generated
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec
+# machine-specific shortcut (recreate with tools/make_shortcut.ps1)
+*.lnk
