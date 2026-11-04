@@ -41,6 +41,13 @@ Windows blocks silent default-app changes: the user must pick LitePDF once in Se
 - Console is cp1252: run scripts with `python -X utf8` when printing Hebrew.
 - Printing renders pages with PyMuPDF at ≤300 dpi (annotations included) and draws them via QPrinter; landscape pages auto-rotate; shrinks only if the page doesn't fit.
 
+## Session 2 (user feedback after real use)
+- Marker only worked word-by-word: selection used PyMuPDF's internal word order, which is scrambled/visual in many PDFs (Word, Hebrew).
+  Fixed with `reading_order()` in canvas.py (geometric rows; RTL rows right-to-left; falls back to page-wide rows when the stream jumps around).
+  Drag may also start in the margin of a line (`_word_start`). Tests: `tests/selection_test.py` + `make_hard_sample.py`.
+- Smooth scrolling: wheel/keys glide via `smooth_scroll_by` (exponential ease, ~110 px per notch); touchpads use pixel deltas. `tests/scroll_test.py`.
+- Repo is PUBLIC: keep personal data out (no absolute user paths); commit with the GitHub no-reply email (repo-local `git config user.email`).
+
 ## Not done / ideas
 - Not verified: how Adobe displays Hebrew inside *its* sticky-note popup (user may see LTR alignment there; our own editor is correct). Interactive print dialog with a physical printer not tried (render pipeline tested via PDF output).
 - AcroForm widgets (real form fields) are displayed but not fillable — use the Text tool.
