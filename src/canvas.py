@@ -774,8 +774,8 @@ class PdfCanvas(QAbstractScrollArea):
             r = groups.get(key)
             if r is None:
                 groups[key] = pymupdf.Rect(w[0], w[1], w[2], w[3])
-            else:
-                r |= pymupdf.Rect(w[0], w[1], w[2], w[3])
+            else:   # (Rect has no in-place union: `r |= x` would only rebind the local name)
+                groups[key] = pymupdf.Rect(min(r.x0, w[0]), min(r.y0, w[1]), max(r.x1, w[2]), max(r.y1, w[3]))
         return list(groups.values())
 
     def selected_text(self) -> str:

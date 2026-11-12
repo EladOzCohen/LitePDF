@@ -48,6 +48,15 @@ Windows blocks silent default-app changes: the user must pick LitePDF once in Se
 - Smooth scrolling: wheel/keys glide via `smooth_scroll_by` (exponential ease, ~110 px per notch); touchpads use pixel deltas. `tests/scroll_test.py`.
 - Repo is PUBLIC: keep personal data out (no absolute user paths); commit with the GitHub no-reply email (repo-local `git config user.email`).
 
+## Session 3 — the REAL marker bug
+- User still saw "marker only highlights single words" after session 2. Cause: `_selection_rects` did `r |= Rect(...)` — `pymupdf.Rect` has
+  no in-place union, so it only rebound a local and every row's highlight kept just the FIRST word's width. Selection itself was fine
+  (sel_words covered the whole line). Fixed by building the union explicitly.
+- Lesson: tests must assert *geometry* (rect widths), not just counts. `tests/selection_test.py` now checks the highlight spans the line.
+- `tests/win32_drag.py <pdf> highlight` posts real WM_LBUTTONDOWN/MOUSEMOVE/UP to the window (no cursor hijack) — use it to reproduce
+  mouse bugs on real PDFs; `tests/real_pdf_drag.py` checks selection counts on real documents.
+- Tests need a scratch dir argument that exists (use `mktemp -d`).
+
 ## Not done / ideas
 - Not verified: how Adobe displays Hebrew inside *its* sticky-note popup (user may see LTR alignment there; our own editor is correct). Interactive print dialog with a physical printer not tried (render pipeline tested via PDF output).
 - AcroForm widgets (real form fields) are displayed but not fillable — use the Text tool.

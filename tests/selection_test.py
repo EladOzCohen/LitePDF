@@ -87,6 +87,11 @@ cv.set_tool("highlight")
 drag(px(*center(a)), px(*center(b)))
 n = [x for x in cv._get_annots(0) if x.kind == 8]
 check(len(n) == 1 and len(n[0].quads) >= 2, f"highlight tool spans multiple lines in one drag (quads={len(n[0].quads) if n else 0})")
+# every quad must cover its whole line, not just the first word (regression: `Rect |=` bug)
+widest = max(q.width for q in n[0].quads)
+first_line = [w for w in doc[0].get_text("words") if abs(w[1] - a[1]) < 3]
+span = max(w[2] for w in first_line) - min(w[0] for w in first_line)
+check(widest > 0.6 * span, f"highlight rectangle spans the whole dragged line ({widest:.0f}pt of {span:.0f}pt)")
 
 # --- Hebrew paragraph (each word its own object, scrambled stream): drag right->left across lines
 heb = [w for w in doc[0].get_text("words") if w[1] > 280]
