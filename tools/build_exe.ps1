@@ -9,6 +9,8 @@ Set-Location $root
     --version-file tools\version_info.txt `
     --paths src `
     --exclude-module tkinter --exclude-module numpy --exclude-module PIL `
+    --exclude-module pandas --exclude-module jedi --exclude-module parso --exclude-module zmq `
+    --exclude-module IPython --exclude-module matplotlib --exclude-module scipy --exclude-module sqlite3 `
     --exclude-module PySide6.QtNetwork --exclude-module PySide6.QtQml --exclude-module PySide6.QtQuick `
     --exclude-module PySide6.QtOpenGL --exclude-module PySide6.QtPdf --exclude-module PySide6.QtWebEngineCore `
     --add-data "assets\litepdf.ico;assets" `

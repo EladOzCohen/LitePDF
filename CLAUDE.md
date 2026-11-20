@@ -81,6 +81,21 @@ Corpus findings that are NOT app bugs: PDFs with broken font encodings (garbage 
 Testing lessons: assert geometry on rendered pixels; PySide `QMenu.exec` can't be monkeypatched (use a fake menu class in the canvas module);
 PyMuPDF `Rect |=` has no in-place union; scratch dirs for tests must exist.
 
+## Installer (session 5)
+`installer\LitePDF.iss` (Inno Setup 6, UTF-8 **with BOM** - build_installer.ps1 adds it) -> `installer\Output\LitePDF-Setup-1.0.0.exe` (~35 MB, lzma2).
+Build: `powershell -File toolsuild_installer.ps1 [-Rebuild]` (builds the exe if dist\ is missing, draws wizard art into installerrt via Qt, compiles).
+- The app is **self-contained** (PyInstaller bundles python313.dll, Qt, PyMuPDF, vcruntime/msvcp/ucrt): verified by running with a stripped PATH and
+  listing loaded DLLs (0 outside the app folder / Windows). So the installer installs NO Python/libraries; it only enforces Windows 10 1809+ x64 (`MinVersion`, `ArchitecturesAllowed`).
+  build_exe.ps1 excludes pandas/jedi/zmq/IPython/... (they sneaked in from the global Python): bundle 145 -> 114 MB.
+- Per-user (`PrivilegesRequired=lowest`, HKA = HKCU, {autopf} = %LOCALAPPDATA%\Programs), no UAC. `PrivilegesRequiredOverridesAllowed=commandline` lets IT use `/ALLUSERS`.
+- English + Hebrew wizard (RTL) picked from the Windows UI language; tasks: desktop icon, "Open with" registration (same keys as toolsegister_default_app.ps1;
+  all removed on uninstall); finish page: launch app / open Windows Default-apps page. Uninstall asks whether to also delete %APPDATA%\LitePDF (signatures, settings); default = keep.
+- Fixed AppId GUID => installing a newer version upgrades in place (Restart Manager closes a running LitePDF, which asks to save). Unsigned => SmartScreen warning on first run.
+- Testing without touching the real setup: compile a variant with `/DAppName="LitePDF Test" /DAppExe=LitePDFTest.exe /DProgId=LitePDFTest.Document /DCapKey=...LitePDFTest... /DRegAppName=LitePDFTest /DAppId={{<other guid>}`
+  then silent install (`/VERYSILENT /DIR=... /TASKS=desktopicon,openwith`), verify, upgrade, uninstall. NEVER run the production Setup.exe from automation:
+  it really installs (a wizard that is opened can be clicked through by whoever is at the PC, and killing Setup.exe leaves its `.tmp` child running).
+- Inno gotchas: `ValueType: none` writes nothing (use string ""); define AppId as `"{{GUID}"` and use `AppId={#AppId}`.
+
 ## Not done / ideas
 - Not verified: how Adobe displays Hebrew inside *its* sticky-note popup (user may see LTR alignment there; our own editor is correct). Interactive print dialog with a physical printer not tried (render pipeline tested via PDF output).
 - AcroForm widgets (real form fields) are displayed but not fillable — use the Text tool.
