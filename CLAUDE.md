@@ -83,7 +83,7 @@ PyMuPDF `Rect |=` has no in-place union; scratch dirs for tests must exist.
 
 ## Installer (session 5)
 `installer\LitePDF.iss` (Inno Setup 6, UTF-8 **with BOM** - build_installer.ps1 adds it) -> `installer\Output\LitePDF-Setup-1.0.0.exe` (~35 MB, lzma2).
-Build: `powershell -File toolsuild_installer.ps1 [-Rebuild]` (builds the exe if dist\ is missing, draws wizard art into installerrt via Qt, compiles).
+Build: `powershell -File tools\build_installer.ps1 [-Rebuild]` (builds the exe if dist\ is missing, draws wizard art into installer\art via Qt, compiles).
 - The app is **self-contained** (PyInstaller bundles python313.dll, Qt, PyMuPDF, vcruntime/msvcp/ucrt): verified by running with a stripped PATH and
   listing loaded DLLs (0 outside the app folder / Windows). So the installer installs NO Python/libraries; it only enforces Windows 10 1809+ x64 (`MinVersion`, `ArchitecturesAllowed`).
   build_exe.ps1 excludes pandas/jedi/zmq/IPython/... (they sneaked in from the global Python): bundle 145 -> 114 MB.
