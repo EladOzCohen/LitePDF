@@ -1,9 +1,12 @@
 """Main window: toolbars, sidebar (pages / contents / notes), search bar, save / print / open logic."""
 from __future__ import annotations
 
+import gc
 import json
+import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import pymupdf
@@ -14,7 +17,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, Q
                                QStackedWidget, QSplitter, QTabWidget, QListWidget, QListWidgetItem,
                                QTreeWidget, QTreeWidgetItem, QLabel, QPushButton, QLineEdit, QSpinBox,
                                QComboBox, QMenu, QFileDialog, QMessageBox, QInputDialog, QFrame,
-                               QApplication, QStatusBar, QSizePolicy)
+                               QApplication, QStatusBar, QSizePolicy, QWidgetAction)
 
 import i18n
 import icons
@@ -64,6 +67,14 @@ class SearchBar(QFrame):
         self.next.setToolTip(T("find_next") + "  (Enter)")
 
 
+class RelayoutList(QListWidget):
+    """Rows whose height depends on the width (wrapped notes) must be laid out again on resize."""
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self.doItemsLayout()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, settings: QSettings):
         super().__init__()
@@ -87,7 +98,7 @@ class MainWindow(QMainWindow):
 
         self.setAcceptDrops(True)
         self.resize(1240, 860)
-        self.setMinimumSize(760, 480)
+        self.setMinimumSize(900, 520)       # the two toolbars need ~880 px
         self.setWindowIcon(icons.app_icon())
 
         self.canvas = PdfCanvas()
@@ -177,7 +188,7 @@ class MainWindow(QMainWindow):
         self.outline.itemClicked.connect(self._outline_clicked)
         self.outline.setItemDelegate(AutoDirDelegate(self.outline))
         self.recent_list.setItemDelegate(AutoDirDelegate(self.recent_list))
-        self.notes_list = QListWidget()
+        self.notes_list = RelayoutList()
         self.notes_list.setItemDelegate(NoteDelegate(self.notes_list))
         self.notes_list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         self.notes_list.itemClicked.connect(self._note_clicked)
@@ -208,7 +219,7 @@ class MainWindow(QMainWindow):
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
         self.search_timer.setInterval(350)
-        self.search_timer.timeout.connect(lambda: self.canvas.search(self.searchbar.edit.text(), restart=True))
+        self.search_timer.timeout.connect(lambda: self.canvas.search(self._query(), restart=True))
         self.notes_timer = QTimer(self)
         self.notes_timer.setSingleShot(True)
         self.notes_timer.setInterval(400)
@@ -216,9 +227,12 @@ class MainWindow(QMainWindow):
 
         self.searchbar.edit.textChanged.connect(lambda _: self.search_timer.start())
         self.searchbar.edit.returnPressed.connect(self._search_enter)
-        self.searchbar.next.clicked.connect(lambda: self.canvas.search(self.searchbar.edit.text(), True))
-        self.searchbar.prev.clicked.connect(lambda: self.canvas.search(self.searchbar.edit.text(), False))
+        self.searchbar.next.clicked.connect(lambda: self._find_again(True))
+        self.searchbar.prev.clicked.connect(lambda: self._find_again(False))
         self.searchbar.close_btn.clicked.connect(self.close_search)
+        esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self.searchbar)
+        esc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        esc.activated.connect(self.close_search)
 
         self.setStatusBar(QStatusBar())
         self.hint_label = QLabel("")
@@ -270,8 +284,8 @@ class MainWindow(QMainWindow):
         for extra, key in ((QShortcut(QKeySequence("Ctrl++"), self), 1.2), ):
             extra.activated.connect(lambda: self.canvas.zoom_by(1.2))
         QShortcut(QKeySequence("Ctrl+1"), self).activated.connect(lambda: self.canvas.set_zoom(1.0))
-        QShortcut(QKeySequence("F3"), self).activated.connect(lambda: self.canvas.search(self.searchbar.edit.text(), True))
-        QShortcut(QKeySequence("Shift+F3"), self).activated.connect(lambda: self.canvas.search(self.searchbar.edit.text(), False))
+        QShortcut(QKeySequence("F3"), self).activated.connect(lambda: self._find_again(True))
+        QShortcut(QKeySequence("Shift+F3"), self).activated.connect(lambda: self._find_again(False))
         QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(self.new_window)
         QShortcut(QKeySequence("Ctrl+Shift+S"), self).activated.connect(lambda: self.save_as())
 
@@ -292,6 +306,7 @@ class MainWindow(QMainWindow):
         self.page_spin.setFixedWidth(62)
         self.page_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.page_spin.valueChanged.connect(self._spin_changed)
+        self.page_spin.lineEdit().returnPressed.connect(lambda: self.canvas.setFocus())
         self.page_total = QLabel(" / 0 ")
         self.tb1.addWidget(self.page_spin)
         self.tb1.addWidget(self.page_total)
@@ -300,7 +315,7 @@ class MainWindow(QMainWindow):
         self.tb1.addAction(self.act_zoom_out)
         self.zoom_combo = QComboBox()
         self.zoom_combo.setEditable(True)
-        self.zoom_combo.setFixedWidth(104)
+        self.zoom_combo.setFixedWidth(124)
         self.zoom_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.zoom_combo.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
         self.zoom_combo.addItem(T("fit_width"), "width")
@@ -309,6 +324,7 @@ class MainWindow(QMainWindow):
             self.zoom_combo.addItem(f"{z}%", z)
         self.zoom_combo.activated.connect(self._zoom_combo_activated)
         self.zoom_combo.lineEdit().editingFinished.connect(self._zoom_text_entered)
+        self.zoom_combo.lineEdit().returnPressed.connect(lambda: self.canvas.setFocus())
         self.tb1.addWidget(self.zoom_combo)
         self.tb1.addAction(self.act_zoom_in)
         self.tb1.addAction(self.act_fit_w)
@@ -342,6 +358,7 @@ class MainWindow(QMainWindow):
             self.tool_actions[name] = a
             return a
 
+        self.tb2.addAction(tool("hand", T("tool_hand"), "hand", "P"))
         self.tb2.addAction(tool("select", T("tool_select"), "select", "V"))
         self.tb2.addSeparator()
         # highlight with color dropdown
@@ -379,10 +396,15 @@ class MainWindow(QMainWindow):
         self.act_invert.toggled.connect(self.toggle_invert)
         m.addAction(self.act_invert)
         lang = m.addMenu(T("language"))
+        self._lang_group = QActionGroup(self)
+        self._lang_group.setExclusive(True)
+        self._lang_actions = {}
         for code, name in (("he", "עברית"), ("en", "English")):
             a = lang.addAction(name)
             a.setCheckable(True)
             a.setChecked(i18n.LANG == code)
+            self._lang_group.addAction(a)
+            self._lang_actions[code] = a
             a.triggered.connect(lambda _=False, c=code: self.change_language(c))
         m.addAction(T("author_name"), self.set_author)
         m.addSeparator()
@@ -404,8 +426,10 @@ class MainWindow(QMainWindow):
         m.addAction(T("text_free"), lambda: self._pick_text_preset(None))
         m.addAction("✓  " + T("text_check"), lambda: self._pick_text_preset("check"))
         m.addAction("✗  " + T("text_cross"), lambda: self._pick_text_preset("cross"))
-        m.addAction(T("text_date") + "  " + QDate.currentDate().toString("dd/MM/yyyy"),
-                    lambda: self._pick_text_preset("date"))
+        self._date_act = m.addAction("", lambda: self._pick_text_preset("date"))
+        m.aboutToShow.connect(lambda: self._date_act.setText(
+            T("text_date") + "  " + QDate.currentDate().toString("dd/MM/yyyy")))
+        self._date_act.setText(T("text_date") + "  " + QDate.currentDate().toString("dd/MM/yyyy"))
         m.addSeparator()
         sm = m.addMenu(T("text_size"))
         for s in TEXT_SIZES:
@@ -428,6 +452,7 @@ class MainWindow(QMainWindow):
         c.requestToolReset.connect(lambda: self.set_tool("select"))
         c.statusMessage.connect(lambda s: self.statusBar().showMessage(s, 2500))
         c.annotsChanged.connect(self._annots_changed)
+        c.pagesChanged.connect(self._pages_changed)
         c.searchResult.connect(self._search_result)
         c.toolShortcut.connect(self._tool_clicked)
 
@@ -509,6 +534,8 @@ class MainWindow(QMainWindow):
         self.invert = on
         self.canvas.set_invert(on)
         self.settings.setValue("invert", on)
+        self._thumb_done.clear()
+        self.thumb_timer.start()
 
     # ================================================================== tools
     def _tool_clicked(self, name: str):
@@ -526,14 +553,14 @@ class MainWindow(QMainWindow):
         if name == c.tool and name != "select":
             name = "select"
         if name == "text":
-            pass
+            self.canvas.text_preset = None
         self.set_tool(name)
 
     def set_tool(self, name: str):
         self.tool_actions[name].setChecked(True)
         self.canvas.set_tool(name)
         hints = {
-            "select": T("hint_select"), "highlight": T("hint_highlight"),
+            "select": T("hint_select"), "hand": T("hint_hand"), "highlight": T("hint_highlight"),
             "underline": T("hint_highlight"), "strike": T("hint_highlight"),
             "note": T("hint_note"), "text": T("hint_text"), "sign": T("hint_sign"),
         }
@@ -574,24 +601,38 @@ class MainWindow(QMainWindow):
             p.end()
         return QIcon(pm)
 
+    def _sig_action(self, menus: list, path: Path, callback) -> QWidgetAction:
+        """A menu entry showing the signature image itself (QMenu has no per-menu icon size)."""
+        host = menus[-1]
+        act = QWidgetAction(host)
+        btn = QToolButton(host)
+        btn.setIcon(self._sig_icon(path))
+        btn.setIconSize(QSize(150, 46))
+        btn.setAutoRaise(True)
+        btn.setToolTip(T("tool_sign"))
+
+        def go():
+            for m in reversed(menus):
+                m.close()
+            QTimer.singleShot(0, lambda: callback(path))
+        btn.clicked.connect(go)
+        act.setDefaultWidget(btn)
+        return act
+
     def _fill_sign_menu(self):
         m = self.sign_menu
         m.clear()
-        m.setIconSize(QSize(150, 46))
+        col = "#e3e5e8" if self.dark else "#34373b"
         sigs = self.store.list()
         for p in sigs:
-            a = m.addAction(self._sig_icon(p), "")
-            a.triggered.connect(lambda _=False, pp=p: self._use_signature(pp))
+            m.addAction(self._sig_action([m], p, self._use_signature))
         if sigs:
             m.addSeparator()
-        m.addAction(icons.icon("plus", "#e3e5e8" if self.dark else "#34373b"), T("new_signature"),
-                    self._new_signature)
+        m.addAction(icons.icon("plus", col), T("new_signature"), self._new_signature)
         if sigs:
-            dm = m.addMenu(icons.icon("trash", "#e3e5e8" if self.dark else "#34373b"), T("delete_signature"))
-            dm.setIconSize(QSize(150, 46))
+            dm = m.addMenu(icons.icon("trash", col), T("delete_signature"))
             for p in sigs:
-                a = dm.addAction(self._sig_icon(p), "")
-                a.triggered.connect(lambda _=False, pp=p: self._delete_signature(pp))
+                dm.addAction(self._sig_action([m, dm], p, self._delete_signature))
 
     def _start_sign(self):
         sigs = self.store.list()
@@ -634,6 +675,8 @@ class MainWindow(QMainWindow):
     # ================================================================== enable / title / status
     def _update_enabled(self):
         has = self.canvas.doc is not None
+        if not has:
+            self.hint_label.setText("")
         for a in (self.act_save, self.act_print, self.act_search, self.act_prev, self.act_next,
                   self.act_zoom_in, self.act_zoom_out, self.act_fit_p, self.act_fit_w, self.act_rotate,
                   self.act_sidebar):
@@ -700,11 +743,24 @@ class MainWindow(QMainWindow):
         t = self.zoom_combo.lineEdit().text().replace("%", "").strip()
         try:
             v = float(t)
+            if not math.isfinite(v) or v <= 0:
+                raise ValueError
             self.canvas.set_zoom(max(10.0, min(800.0, v)) / 100.0)
         except ValueError:
-            pass
+            self._zoom_changed(self.canvas.zoom)          # not a number: put the real zoom back in the box
 
     # ================================================================== search
+    def _query(self) -> str:
+        return self.searchbar.edit.text().strip()
+
+    def _find_again(self, forward: bool):
+        if not self.canvas.doc:
+            return
+        if not self.searchbar.isVisible():       # F3 with the bar closed: bring it back instead of searching blind
+            self.show_search()
+            return
+        self.canvas.search(self._query(), forward)
+
     def show_search(self):
         if not self.canvas.doc:
             return
@@ -721,7 +777,7 @@ class MainWindow(QMainWindow):
     def _search_enter(self):
         mods = QApplication.keyboardModifiers()
         self.search_timer.stop()
-        self.canvas.search(self.searchbar.edit.text(), not (mods & Qt.KeyboardModifier.ShiftModifier))
+        self.canvas.search(self._query(), not (mods & Qt.KeyboardModifier.ShiftModifier))
 
     def _search_result(self, cur: int, total: int):
         if not self.searchbar.edit.text():
@@ -774,6 +830,7 @@ class MainWindow(QMainWindow):
         stack: list[tuple[int, QTreeWidgetItem]] = []
         for lvl, title, page, *_ in toc:
             it = QTreeWidgetItem([title])
+            it.setToolTip(0, title)
             it.setData(0, Qt.ItemDataRole.UserRole, page - 1)
             while stack and stack[-1][0] >= lvl:
                 stack.pop()
@@ -824,6 +881,12 @@ class MainWindow(QMainWindow):
         if idx == 2 and self._notes_stale:
             self._refresh_notes()
 
+    def _pages_changed(self):
+        if self.canvas.doc:
+            self._build_sidebar()
+            if self.sidebar.isVisible():
+                self.thumb_timer.start()
+
     def _annots_changed(self):
         self._notes_stale = True
         self._thumb_done.discard(self.canvas.current_page)
@@ -858,7 +921,10 @@ class MainWindow(QMainWindow):
 
     def open_path(self, path: str):
         path = os.path.abspath(path)
-        if self.canvas.doc and not self._maybe_save():
+        c = self.canvas
+        c.commit_pending()
+        same = bool(c.doc) and bool(c.path) and os.path.normcase(path) == os.path.normcase(os.path.abspath(c.path))
+        if same and c.is_dirty and not self._maybe_save():       # re-opening the file we are editing
             return
         if not os.path.exists(path):
             QMessageBox.warning(self, APP_NAME, T("file_missing", path))
@@ -868,6 +934,10 @@ class MainWindow(QMainWindow):
             doc = pymupdf.open(path)
         except Exception as e:
             QMessageBox.critical(self, APP_NAME, T("open_failed", str(e)))
+            return
+        if not doc.is_pdf:                      # PyMuPDF also opens images/epub/txt: we only edit and save PDFs
+            doc.close()
+            QMessageBox.warning(self, APP_NAME, T("not_pdf", os.path.basename(path)))
             return
         pw = None
         if doc.needs_pass:
@@ -885,6 +955,9 @@ class MainWindow(QMainWindow):
         if doc.page_count == 0:
             doc.close()
             QMessageBox.warning(self, APP_NAME, T("empty_pdf"))
+            return
+        if not same and c.doc and not self._maybe_save():       # only now: the new file is known to be fine
+            doc.close()
             return
         self._save_position()
         self._password = pw
@@ -994,6 +1067,8 @@ class MainWindow(QMainWindow):
     def _maybe_save(self) -> bool:
         """Return True when it is OK to discard / replace the current document."""
         c = self.canvas
+        if c.doc:
+            c.commit_pending()               # text typed in an open note/text box counts as a change
         if not c.doc or not c.is_dirty:
             return True
         box = QMessageBox(self)
@@ -1016,6 +1091,7 @@ class MainWindow(QMainWindow):
         c = self.canvas
         if not c.doc:
             return False
+        c.commit_pending()
         if not c.path:
             return self.save_as()
         if not c.is_dirty:
@@ -1042,6 +1118,7 @@ class MainWindow(QMainWindow):
         c = self.canvas
         if not c.doc:
             return False
+        c.commit_pending()
         base = Path(c.path) if c.path else Path.home() / "Documents" / "document.pdf"
         suggestion = str(base.with_name(base.stem + T("copy_suffix") + ".pdf"))
         path, _ = QFileDialog.getSaveFileName(self, T("save_as"), suggestion, "PDF (*.pdf)")
@@ -1049,49 +1126,129 @@ class MainWindow(QMainWindow):
             return False
         if not path.lower().endswith(".pdf"):
             path += ".pdf"
+            if os.path.exists(path):          # the dialog could not warn about this name: ask ourselves
+                ans = QMessageBox.question(self, T("save_as"), T("replace_q", os.path.basename(path)),
+                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                if ans != QMessageBox.StandardButton.Yes:
+                    return False
         if c.path and os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(c.path)):
             self._overwrite_ok = True
             return self._write(c.path)
         return self._write(path)
 
     def _write(self, target: str) -> bool:
-        """Write the document to target (in place if it is the open file)."""
+        """Write the document to `target` (in place if it is the open file).
+
+        Rule: unsaved work is never thrown away. Whatever fails (read-only file, file locked by
+        another program, disk full...) the live document stays open and dirty."""
         c = self.canvas
         doc = c.doc
+        if doc is None:
+            return False
+        c.commit_pending()
+        target = os.path.abspath(target)
         state = self._view_state()
+        had_history = c.can_undo()
+        orig_path = c.path
+        in_place = bool(orig_path) and os.path.normcase(target) == os.path.normcase(os.path.abspath(orig_path))
         try:
-            c.purge_trashed()
-            in_place = c.path and os.path.normcase(os.path.abspath(target)) == os.path.normcase(os.path.abspath(c.path))
-            if in_place and doc.can_save_incrementally():
+            signed = doc.get_sigflags() > 0
+        except Exception:
+            signed = False
+        had_trash = bool(c.trashed)
+        # A full rewrite is needed for Save As, repaired files, and whenever something was deleted
+        # (an incremental save would leave the deleted note / signature image inside the file).
+        file_backed = bool(doc.name) and os.path.isfile(doc.name) and bool(orig_path) and             os.path.normcase(os.path.abspath(doc.name)) == os.path.normcase(os.path.abspath(orig_path))
+        # (a document continued from memory after a failed save claims it can save incrementally - it cannot)
+        needs_full = (not in_place) or (not file_backed) or (not doc.can_save_incrementally()) or (had_trash and not signed)
+        if needs_full and signed:        # a rewrite breaks an existing digital signature
+            ans = QMessageBox.question(self, T("save"), T("signed_warn"),
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if ans != QMessageBox.StandardButton.Yes:
+                return False
+        tmp = target + ".litepdf.tmp"
+        try:
+            if had_trash:
+                c.purge_trashed()
+            if not needs_full:
                 doc.saveIncr()
+                new = pymupdf.open(target)
+                self._release_document(doc)
             else:
-                tmp = target + ".litepdf.tmp"
-                doc.save(tmp, garbage=1, deflate=True, encryption=pymupdf.PDF_ENCRYPT_KEEP)
-                doc.close()
-                os.replace(tmp, target)
-            if not doc.is_closed:
-                doc.close()
+                doc.save(tmp, garbage=3 if had_trash else 1, deflate=True, encryption=pymupdf.PDF_ENCRYPT_KEEP)
+                if in_place:
+                    self._release_document(doc)      # Windows cannot replace a file that is still open
+                try:
+                    self._replace_file(tmp, target)
+                except OSError:
+                    if in_place:                     # keep the work: carry on from the finished temp copy
+                        mem = pymupdf.open("pdf", Path(tmp).read_bytes())
+                        if mem.needs_pass and self._password:
+                            mem.authenticate(self._password)
+                        self._load(mem, orig_path, restore_state=state)
+                        c._force_dirty = True
+                        c._set_dirty(True)
+                    raise
+                new = pymupdf.open(target)
+                if not in_place:
+                    self._release_document(doc)
             # Always reopen from disk: PyMuPDF's in-memory state can go stale after a save
             # (e.g. a later rotate + incremental save would drop annotations).
-            new = pymupdf.open(target)
             if new.needs_pass and self._password:
                 new.authenticate(self._password)
             self._load(new, target, restore_state=state)
-            self._update_title()
-            self.statusBar().showMessage(T("saved_to", os.path.basename(target)), 3500)
+            msg = T("saved_to", os.path.basename(target))
+            if had_history:
+                msg += "  " + T("undo_cleared")
+            self.statusBar().showMessage(msg, 5000)
             return True
         except Exception as e:
-            QMessageBox.critical(self, T("save"), T("save_failed", str(e)))
-            if c.doc is not None and c.doc.is_closed:
-                try:
-                    self._load(pymupdf.open(c.path), c.path, restore_state=state)
-                except Exception:
-                    pass
+            self._save_failed(e)
             return False
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+    def _release_document(self, doc: pymupdf.Document):
+        """Close a document and make sure nothing keeps its file open (cached Page objects hold it alive)."""
+        self.canvas._page_objs.clear()
+        try:
+            doc.close()
+        finally:
+            gc.collect()
+
+    @staticmethod
+    def _replace_file(src: str, dst: str, tries: int = 6):
+        """os.replace with a few retries: antivirus / the search indexer often hold a fresh file for a moment."""
+        for k in range(tries):
+            try:
+                os.replace(src, dst)
+                return
+            except PermissionError:
+                if k == tries - 1:
+                    raise
+                time.sleep(0.15 * (k + 1))
+
+    def _save_failed(self, e: Exception):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle(T("save"))
+        box.setText(T("save_failed", str(e)))
+        b_copy = None
+        if isinstance(e, OSError):
+            b_copy = box.addButton(T("save_copy"), QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if b_copy is not None and box.clickedButton() is b_copy:
+            QTimer.singleShot(0, self.save_as)
 
     def print_doc(self):
         if not self.canvas.doc:
             return
+        self.canvas.commit_pending()
         printing.print_document(self, self.canvas.doc, self.canvas.current_page)
 
     # ================================================================== misc menu actions
@@ -1103,6 +1260,8 @@ class MainWindow(QMainWindow):
         if code == i18n.LANG:
             return
         if not self._maybe_save():
+            for c, a in self._lang_actions.items():          # cancelled: show the language that is really active
+                a.setChecked(c == i18n.LANG)
             return
         self.settings.setValue("lang", code)
         self._save_position()
@@ -1127,6 +1286,7 @@ class MainWindow(QMainWindow):
 
     # ================================================================== events
     def closeEvent(self, ev):
+        self.canvas.commit_pending()
         if not self._force_close and not self._maybe_save():
             ev.ignore()
             return

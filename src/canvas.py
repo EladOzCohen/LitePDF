@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import bisect
 import math
+import sys
+import traceback
 import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -21,7 +23,7 @@ from dataclasses import dataclass, field
 import pymupdf
 from PySide6.QtCore import Qt, QRect, QRectF, QPoint, QPointF, QTimer, Signal, QUrl, QElapsedTimer
 from PySide6.QtGui import (QPainter, QColor, QImage, QPixmap, QPen, QBrush, QCursor,
-                           QDesktopServices, QAction, QKeyEvent)
+                           QDesktopServices, QAction, QKeyEvent, QTransform)
 from PySide6.QtWidgets import QAbstractScrollArea, QApplication, QMenu, QFrame
 
 from i18n import T
@@ -167,6 +169,7 @@ class PdfCanvas(QAbstractScrollArea):
     annotsChanged = Signal()
     searchResult = Signal(int, int)
     toolShortcut = Signal(str)
+    pagesChanged = Signal()          # page sizes changed (rotation)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -223,6 +226,12 @@ class PdfCanvas(QAbstractScrollArea):
         self.redo_stack: list[Cmd] = []
         self.trashed: set[tuple[int, int]] = set()
         self._dirty = False
+        self._clean_top = None          # undo-stack top at last save (dirty = top changed)
+        self._force_dirty = False       # changes that are not in the undo stack (rotation...)
+        self._stamp_imgs: dict[int, QImage] = {}   # xref -> upright image of stamps made in this session
+        self._paint_err = False
+        self._drag_btn = Qt.MouseButton.LeftButton
+        self._last_mouse = QPoint()
 
         # popups
         self._popup = None
@@ -248,6 +257,9 @@ class PdfCanvas(QAbstractScrollArea):
         self._anim_setting = False
         self._last_scroll_v = 0
         self._scroll_dir = 1
+        self._autoscroll_timer = QTimer(self)
+        self._autoscroll_timer.setInterval(30)
+        self._autoscroll_timer.timeout.connect(self._autoscroll_step)
 
     # ------------------------------------------------------------------ document
     @property
@@ -276,6 +288,10 @@ class PdfCanvas(QAbstractScrollArea):
         self.redo_stack.clear()
         self.trashed.clear()
         self._drag = None
+        self._autoscroll_timer.stop()
+        self._stamp_imgs.clear()
+        self._clean_top = None
+        self._force_dirty = False
         self.clear_search()
         self._set_dirty(False)
         self.undoStateChanged.emit()
@@ -307,7 +323,15 @@ class PdfCanvas(QAbstractScrollArea):
             self._dirty = v
             self.dirtyChanged.emit(v)
 
+    def _top(self):
+        return self.undo_stack[-1] if self.undo_stack else None
+
+    def _refresh_dirty(self):
+        self._set_dirty(self._force_dirty or self._top() is not self._clean_top)
+
     def mark_clean(self):
+        self._force_dirty = False
+        self._clean_top = self._top()
         self._set_dirty(False)
 
     # ------------------------------------------------------------------ layout / zoom
@@ -389,14 +413,19 @@ class PdfCanvas(QAbstractScrollArea):
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
         if self.doc:
+            page, off_pt = self._cur_page, 0.0
+            if self.tops and page < len(self.tops):
+                off_pt = (self.verticalScrollBar().value() - self.tops[page]) / max(self.s, 1e-6)
             if self.fit_mode:
                 self._apply_fit()
                 self.zoomChanged.emit(self.zoom)
             self._relayout()
+            if self.fit_mode and self.tops and page < len(self.tops):      # stay on the same page/offset
+                self.verticalScrollBar().setValue(int(self.tops[page] + off_pt * self.s))
             self._reposition_popup()
 
     def goto_page(self, n: int, y_pt: float = 0.0):
-        if not self.doc:
+        if not self.doc or not self.tops:
             return
         n = max(0, min(self.page_count - 1, n))
         self.verticalScrollBar().setValue(int(self.tops[n] + y_pt * self.s - 8))
@@ -497,8 +526,8 @@ class PdfCanvas(QAbstractScrollArea):
         rs = self.s * self.devicePixelRatioF()
         r = self.page_rects[i]
         area = r.width * r.height * rs * rs
-        if area > 6e7:
-            rs *= math.sqrt(6e7 / area)
+        if area > 2.5e7:          # ~100 MB per page: bigger renders stall the UI for seconds at high zoom
+            rs *= math.sqrt(2.5e7 / area)
         return rs
 
     def _pixmap(self, i: int) -> QPixmap:
@@ -545,7 +574,7 @@ class PdfCanvas(QAbstractScrollArea):
             self.viewport().update()
 
     def _prefetch(self):
-        if not self.doc:
+        if not self.doc or self.s * self.devicePixelRatioF() > 3.0:      # huge pages: don't pre-render neighbours
             return
         first, last = self._visible_range()
         if self._scroll_dir >= 0:
@@ -563,20 +592,27 @@ class PdfCanvas(QAbstractScrollArea):
     # ------------------------------------------------------------------ painting
     def paintEvent(self, ev):
         p = QPainter(self.viewport())
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         p.fillRect(self.viewport().rect(), QColor("#3b3d40") if self.dark_bg else QColor("#d9dbde"))
-        if not self.doc:
+        if not self.doc or not self.tops:
+            p.end()
             return
-        first, last = self._visible_range()
-        for i in range(first, last + 1):
-            ox, oy = self._origin(i)
-            r = QRect(ox, oy, self.pw[i], self.ph[i])
-            pm = self._pixmap(i)
-            p.drawPixmap(r, pm)
-            p.setPen(QPen(QColor(0, 0, 0, 70), 1))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRect(r.adjusted(-1, -1, 0, 0))
-            self._paint_overlays(p, i)
-        self._paint_drag_preview(p)
+        try:
+            first, last = self._visible_range()
+            for i in range(first, last + 1):
+                ox, oy = self._origin(i)
+                r = QRect(ox, oy, self.pw[i], self.ph[i])
+                pm = self._pixmap(i)
+                p.drawPixmap(r, pm)
+                p.setPen(QPen(QColor(0, 0, 0, 70), 1))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(r.adjusted(-1, -1, 0, 0))
+                self._paint_overlays(p, i)
+            self._paint_drag_preview(p)
+        except Exception:      # never let a bad page/annotation raise out of paintEvent (would spam error boxes)
+            if not self._paint_err:
+                self._paint_err = True
+                traceback.print_exc(file=sys.stderr)
         p.end()
         if not self._prefetch_timer.isActive():
             self._prefetch_timer.start(25)
@@ -659,17 +695,57 @@ class PdfCanvas(QAbstractScrollArea):
             p.drawRect(r)
 
     # ------------------------------------------------------------------ page data helpers
+    # PyMuPDF returns text, annotation rects/quads, links and search hits in the page's UNROTATED
+    # frame, while page.rect and the rendered image are ROTATED (/Rotate). Everything inside the
+    # canvas works in the visible (rotated) frame; these helpers convert at the boundary.
+    def _vis_rect(self, i: int, r) -> pymupdf.Rect:
+        pg = self._page(i)
+        rr = pymupdf.Rect(r)
+        return rr * pg.rotation_matrix if pg.rotation else rr
+
+    def _unrot_rect(self, i: int, r) -> pymupdf.Rect:
+        pg = self._page(i)
+        rr = pymupdf.Rect(r)
+        return rr * pg.derotation_matrix if pg.rotation else rr
+
+    def _unrot_quad(self, i: int, r):
+        """Visible rect -> quad in the unrotated frame with the visual corner order preserved
+        (so MuPDF draws the highlight caps along the visual text direction)."""
+        pg = self._page(i)
+        rr = pymupdf.Rect(r)
+        return rr.quad * pg.derotation_matrix if pg.rotation else rr
+
+    def _unrot_point(self, i: int, x: float, y: float) -> pymupdf.Point:
+        pg = self._page(i)
+        pt = pymupdf.Point(x, y)
+        return pt * pg.derotation_matrix if pg.rotation else pt
+
+    def _trim_caches(self, keep_near: int):
+        for store in (self._words, self._annots, self._links):
+            if len(store) > 80:
+                for k in [k for k in store if abs(k - keep_near) > 40]:
+                    store.pop(k, None)
+
     def _get_words(self, i: int) -> list:
         w = self._words.get(i)
         if w is None:
-            w = reading_order(self._page(i).get_text("words"))
+            raw = self._page(i).get_text("words")
+            if self._page(i).rotation:
+                raw = [(*tuple(self._vis_rect(i, x[:4])), *x[4:]) for x in raw]
+            w = reading_order(raw)
             self._words[i] = w
+            self._trim_caches(i)
         return w
 
     def _get_links(self, i: int) -> list:
         l = self._links.get(i)
         if l is None:
-            l = self._page(i).get_links()
+            l = []
+            for lk in self._page(i).get_links():
+                lk = dict(lk)
+                if lk.get("from") is not None:
+                    lk["from"] = self._vis_rect(i, lk["from"])
+                l.append(lk)
             self._links[i] = l
         return l
 
@@ -689,9 +765,9 @@ class PdfCanvas(QAbstractScrollArea):
             if t in MARKUP:
                 v = a.vertices or []
                 for k in range(0, len(v) - 3, 4):
-                    quads.append(pymupdf.Quad(v[k:k + 4]).rect)
+                    quads.append(self._vis_rect(i, pymupdf.Quad(v[k:k + 4]).rect))
             info = a.info
-            lst.append(AInfo(a.xref, t, pymupdf.Rect(a.rect), quads,
+            lst.append(AInfo(a.xref, t, self._vis_rect(i, a.rect), quads,
                              info.get("content", "") or "", info.get("subject", "") or ""))
         self._annots[i] = lst
         return lst
@@ -815,10 +891,29 @@ class PdfCanvas(QAbstractScrollArea):
             self.viewport().update()
 
     # ------------------------------------------------------------------ undo / redo / trash
+    def cancel_drag(self):
+        """Abort a move/resize/select drag, restoring a stamp that was hidden for its preview."""
+        d = self._drag
+        self._drag = None
+        self._autoscroll_timer.stop()
+        if d and d.get("kind") in ("move", "resize") and d.get("started"):
+            if (d["pg"], d["xref"]) not in self.trashed:
+                a = self._find(d["pg"], d["xref"])
+                if a:
+                    a.set_flags(a.flags & ~HIDDEN)
+            self._invalidate([d["pg"]])
+        self.viewport().update()
+
+    def commit_pending(self):
+        """Finish whatever the user is in the middle of (typing in a popup, dragging) - call before
+        saving, closing, opening another file, printing..."""
+        self.cancel_drag()
+        self._close_popup(commit=True)
+
     def _push(self, undo, redo, pages):
         self.undo_stack.append(Cmd(undo, redo, list(pages)))
         self.redo_stack.clear()
-        self._set_dirty(True)
+        self._refresh_dirty()
         self._invalidate(pages)
         self.undoStateChanged.emit()
 
@@ -829,7 +924,7 @@ class PdfCanvas(QAbstractScrollArea):
         return bool(self.redo_stack)
 
     def undo(self):
-        self._close_popup(commit=True)
+        self.commit_pending()
         if not self.undo_stack:
             return
         c = self.undo_stack.pop()
@@ -838,7 +933,7 @@ class PdfCanvas(QAbstractScrollArea):
         self._after_history(c)
 
     def redo(self):
-        self._close_popup(commit=True)
+        self.commit_pending()
         if not self.redo_stack:
             return
         c = self.redo_stack.pop()
@@ -848,7 +943,7 @@ class PdfCanvas(QAbstractScrollArea):
 
     def _after_history(self, c: Cmd):
         self.sel_annot = None
-        self._set_dirty(True)
+        self._refresh_dirty()
         self._invalidate(c.pages)
         self.undoStateChanged.emit()
         self.selectionChanged.emit(False)
@@ -875,6 +970,7 @@ class PdfCanvas(QAbstractScrollArea):
         self._invalidate([pg])
 
     def delete_annot(self, pg: int, xref: int):
+        self.cancel_drag()
         self._hide_raw(pg, xref)
         self._push(lambda: self._show_raw(pg, xref), lambda: self._hide_raw(pg, xref), [pg])
         if self.sel_annot == (pg, xref):
@@ -885,10 +981,11 @@ class PdfCanvas(QAbstractScrollArea):
         if self.sel_annot:
             self.delete_annot(*self.sel_annot)
 
-    def purge_trashed(self):
+    def purge_trashed(self) -> int:
         """Physically remove soft-deleted annotations (call right before saving)."""
         if not self.doc:
-            return
+            return 0
+        n = len(self.trashed)
         by_page: dict[int, set] = {}
         for pg, xref in self.trashed:
             by_page.setdefault(pg, set()).add(xref)
@@ -901,7 +998,9 @@ class PdfCanvas(QAbstractScrollArea):
         self.undo_stack.clear()
         self.redo_stack.clear()
         self._annots.clear()
+        self._force_dirty = True          # the undo history is gone but the document is still unsaved
         self.undoStateChanged.emit()
+        return n
 
     # ------------------------------------------------------------------ creating annotations
     def _style(self, a, color=None):
@@ -920,18 +1019,23 @@ class PdfCanvas(QAbstractScrollArea):
         else:
             pg = rects[0]
             rects = rects[1]
+        rects = [r for r in rects if r.width > 0.2 and r.height > 0.2]       # degenerate boxes raise in MuPDF
         if not rects:
             return False
         page = self._page(pg)
-        if kind == "highlight":
-            a = page.add_highlight_annot(quads=rects)
-            color = self.hl_color
-        elif kind == "underline":
-            a = page.add_underline_annot(quads=rects)
-            color = (0.1, 0.35, 0.95)
-        else:
-            a = page.add_strikeout_annot(quads=rects)
-            color = (0.9, 0.1, 0.1)
+        unrot = [self._unrot_quad(pg, r) for r in rects]
+        try:
+            if kind == "highlight":
+                a = page.add_highlight_annot(quads=unrot)
+                color = self.hl_color
+            elif kind == "underline":
+                a = page.add_underline_annot(quads=unrot)
+                color = (0.1, 0.35, 0.95)
+            else:
+                a = page.add_strikeout_annot(quads=unrot)
+                color = (0.9, 0.1, 0.1)
+        except (ValueError, RuntimeError):
+            return False
         self._style(a, color)
         xref = a.xref
         self._push_added(pg, xref)
@@ -947,16 +1051,33 @@ class PdfCanvas(QAbstractScrollArea):
         r = self.page_rects[pg]
         x = max(0, min(r.width - 18, x - 8))
         y = max(0, min(r.height - 18, y - 8))
-        a = page.add_text_annot((x, y), "", icon="Note")
+        pt = self._unrot_point(pg, x, y)       # note icons are NoRotate: their top-left corner is pinned
+        a = page.add_text_annot((pt.x, pt.y), "", icon="Note")
         self._style(a, (1.0, 0.8, 0.0))
         xref = a.xref
         self._invalidate([pg])
         self._open_note_editor(pg, xref, "", new=True)
 
     def add_stamp(self, pg: int, png: bytes, rect: pymupdf.Rect, content="", subject="") -> int:
+        """rect is in the VISIBLE frame; png is the upright image."""
         page = self._page(pg)
-        a = page.add_stamp_annot(rect, stamp=png)
+        upright = QImage.fromData(png)
+        rot = page.rotation
+        if rot:       # pre-rotate so that it looks upright after the page rotation is applied
+            png_w = image_to_png(upright.transformed(QTransform().rotate(-rot)))
+        else:
+            png_w = png
+        doc = self.doc
+        before = doc.xref_length()
+        a = page.add_stamp_annot(self._unrot_rect(pg, rect), stamp=png_w)
         a.set_info(title=self.author or "LitePDF", content=content, subject=subject)
+        for x in range(before, doc.xref_length()):      # raw (uncompressed) image streams make files balloon
+            try:
+                if doc.xref_is_stream(x) and "Filter" not in doc.xref_get_keys(x):
+                    doc.update_stream(x, doc.xref_stream_raw(x), new=False, compress=True)
+            except Exception:
+                pass
+        self._stamp_imgs[a.xref] = upright.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
         return a.xref
 
     def _clamp_rect(self, pg: int, rect: pymupdf.Rect) -> pymupdf.Rect:
@@ -984,23 +1105,26 @@ class PdfCanvas(QAbstractScrollArea):
         self.selectionChanged.emit(True)
         self.requestToolReset.emit()
 
-    def _make_text_stamp(self, text: str, preset: str | None = None):
-        size = self.text_opts["size"]
-        family = self.text_opts["family"]
+    def _make_text_stamp(self, text: str, preset: str | None = None, opts: dict | None = None):
+        o = opts or self.text_opts
+        size = o["size"]
+        family = o.get("family", self.text_opts["family"])
         if preset in ("check", "cross"):
             family = "Segoe UI Symbol"
             size = max(size, 14)
-        img, w, h = render_text(text, size, self.text_opts["color"], family)
+        img, w, h = render_text(text, size, o["color"], family)
         return image_to_png(img), w, h
 
     def place_text(self, pg: int, x: float, y: float, text: str, preset: str | None = None,
-                   replace_xref: int | None = None):
+                   replace_xref: int | None = None, opts: dict | None = None):
         text = text.rstrip()
         if not text.strip():
             return
-        png, w, h = self._make_text_stamp(text, preset)
+        text = text[:2000]                       # keep the generated image a sane size
+        o = opts or self.text_opts
+        png, w, h = self._make_text_stamp(text, preset, o)
         rect = self._clamp_rect(pg, pymupdf.Rect(x, y, x + w, y + h))
-        tag = f"{TEXT_STAMP_TAG}|{self.text_opts['size']}|{','.join(str(int(c)) for c in self.text_opts['color'])}"
+        tag = f"{TEXT_STAMP_TAG}|{o['size']}|{','.join(str(int(c)) for c in o['color'])}"
         old = replace_xref
         xref = self.add_stamp(pg, png, rect, content=text, subject=tag)
         if old is not None:
@@ -1028,7 +1152,7 @@ class PdfCanvas(QAbstractScrollArea):
                 p.hide()
                 p.deleteLater()
 
-    def _reposition_popup(self):
+    def _reposition_popup(self, allow_close: bool = True):
         if self._popup is None or self._popup_anchor is None:
             return
         pg, x, y = self._popup_anchor
@@ -1036,6 +1160,10 @@ class PdfCanvas(QAbstractScrollArea):
             return
         pt = self._to_px(pg, x, y)
         vp = self.viewport()
+        if allow_close and (pt.y() < -self._popup.height() or pt.y() > vp.height()
+                            or pt.x() < -self._popup.width() or pt.x() > vp.width()):
+            self._close_popup(commit=True)      # its anchor scrolled out of view: finish instead of floating
+            return
         px = int(max(0, min(vp.width() - self._popup.width(), pt.x())))
         py = int(max(0, min(vp.height() - self._popup.height(), pt.y())))
         self._popup.move(px, py)
@@ -1046,7 +1174,7 @@ class PdfCanvas(QAbstractScrollArea):
         self._popup_anchor = (pg, x, y)
         popup.setParent(self.viewport())
         popup.show()
-        self._reposition_popup()
+        self._reposition_popup(allow_close=False)
         popup.raise_()
 
     def _open_note_editor(self, pg: int, xref: int, text: str, new=False):
@@ -1124,14 +1252,15 @@ class PdfCanvas(QAbstractScrollArea):
         self._push(lambda: self._set_content_raw(pg, xref, old),
                    lambda: self._set_content_raw(pg, xref, new), [pg])
 
-    def _begin_text_input(self, pg: int, x: float, y: float, text="", replace_xref=None, preset=None):
-        px = self.text_opts["size"] * self.s
-        pop = TextPopup(self.viewport(), text, px, self.text_opts["color"], self.text_opts["family"])
+    def _begin_text_input(self, pg: int, x: float, y: float, text="", replace_xref=None, preset=None, opts=None):
+        o = opts or self.text_opts
+        px = o["size"] * self.s
+        pop = TextPopup(self.viewport(), text, px, o["color"], self.text_opts["family"])
 
         def committed(t: str):
             if self._popup is pop:
                 self._popup = None
-            self.place_text(pg, x, y, t, preset, replace_xref)
+            self.place_text(pg, x, y, t, preset, replace_xref, opts=o if opts else None)
             self.viewport().setFocus()
 
         def cancelled():
@@ -1164,9 +1293,15 @@ class PdfCanvas(QAbstractScrollArea):
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
                 hits = []
-                for i in range(self.page_count):
-                    for r in self._page(i).search_for(text):
-                        hits.append((i, pymupdf.Rect(r)))
+                needle = text.replace("\x00", "")
+                for i in range(self.page_count if needle.strip() else 0):
+                    page = self._page(i)
+                    found = [self._vis_rect(i, r) for r in (page.search_for(needle) or [])]
+                    expected = page.get_text("text").lower().count(needle.lower()) if found else 0
+                    if len(found) > expected:       # one match came back as several boxes (per-letter runs): merge
+                        found = self._merge_hits(found)
+                    for r in found:
+                        hits.append((i, r))
                 self._hits = hits
             finally:
                 QApplication.restoreOverrideCursor()
@@ -1182,6 +1317,20 @@ class PdfCanvas(QAbstractScrollArea):
         self.searchResult.emit(self._hit_idx + 1 if self._hits else 0, len(self._hits))
         self.viewport().update()
 
+    @staticmethod
+    def _merge_hits(rects: list) -> list:
+        """One match can come back as several touching boxes (per letter run); merge them per line."""
+        out: list = []
+        for r in sorted(rects, key=lambda r: (round((r.y0 + r.y1) / 2 / 3), r.x0)):
+            if out:
+                q = out[-1]
+                same_row = abs((q.y0 + q.y1) / 2 - (r.y0 + r.y1) / 2) < 0.5 * max(q.height, r.height)
+                if same_row and r.x0 - q.x1 < 1.5 and r.x1 >= q.x0:
+                    out[-1] = pymupdf.Rect(min(q.x0, r.x0), min(q.y0, r.y0), max(q.x1, r.x1), max(q.y1, r.y1))
+                    continue
+            out.append(pymupdf.Rect(r))
+        return out
+
     def _goto_hit(self):
         pg, r = self._hits[self._hit_idx]
         vp = self.viewport()
@@ -1196,9 +1345,16 @@ class PdfCanvas(QAbstractScrollArea):
     def rotate_all(self, delta: int):
         if not self.doc:
             return
-        self._close_popup(commit=True)
+        self.commit_pending()
+        failed = 0
         for p in self.doc:
-            p.set_rotation((p.rotation + delta) % 360)
+            try:
+                p.set_rotation((p.rotation + delta) % 360)
+            except Exception:
+                failed += 1               # a broken page object must not abort the whole rotation
+        if failed:
+            self.statusMessage.emit(T("rotate_partial", failed))
+        self.clear_search()
         self._compute_page_rects()
         self._cache.clear()
         self._cache_bytes = 0
@@ -1214,7 +1370,9 @@ class PdfCanvas(QAbstractScrollArea):
         self._relayout()
         self.goto_page(self._cur_page)
         self.zoomChanged.emit(self.zoom)
+        self._force_dirty = True
         self._set_dirty(True)
+        self.pagesChanged.emit()
         self.viewport().update()
 
     def collect_notes(self) -> list[tuple[int, int, int, str]]:
@@ -1237,7 +1395,10 @@ class PdfCanvas(QAbstractScrollArea):
 
     # ------------------------------------------------------------------ tools
     def set_tool(self, name: str):
-        self._close_popup(commit=True)
+        self.commit_pending()
+        if name != "select" and self.sel_annot:
+            self.sel_annot = None           # a stale selection (with handles) must not hijack the new tool
+            self.selectionChanged.emit(False)
         self.tool = name
         self._update_cursor(self._hover)
         self.viewport().update()
@@ -1246,6 +1407,15 @@ class PdfCanvas(QAbstractScrollArea):
         c = Qt.CursorShape.ArrowCursor
         if self.tool in ("note", "text", "sign"):
             c = Qt.CursorShape.CrossCursor
+        elif self.tool == "hand":
+            c = Qt.CursorShape.OpenHandCursor
+            if pos is not None and self.doc:
+                pg = self._page_at(pos)
+                if pg >= 0:
+                    x, y = self._to_page(pg, pos)
+                    a = self._annot_at(pg, x, y)
+                    if (a is not None and a.kind in (A_TEXT, *MARKUP)) or self._link_at(pg, x, y):
+                        c = Qt.CursorShape.PointingHandCursor
         elif pos is not None and self.doc:
             pg = self._page_at(pos)
             if pg >= 0:
@@ -1284,6 +1454,10 @@ class PdfCanvas(QAbstractScrollArea):
         pos = ev.position().toPoint()
         if self._popup is not None and not self._popup.geometry().contains(pos):
             self._close_popup(commit=True)
+        if self._drag is not None and ev.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.MiddleButton):
+            self.cancel_drag()             # a lost button-release must not leave a drag (or hidden stamp) behind
+        self._drag_btn = ev.button()
+        self._last_mouse = pos
         if ev.button() == Qt.MouseButton.MiddleButton:
             self._begin_pan(pos)
             self._moved = True
@@ -1293,7 +1467,7 @@ class PdfCanvas(QAbstractScrollArea):
         self._press_pos = pos
         self._moved = False
         self._pending_click = None
-        h = self._handle_at(pos)
+        h = self._handle_at(pos) if self.tool in ("select", *MARKUP_TOOLS) else None
         if h:
             self._begin_resize(h)
             return
@@ -1304,6 +1478,18 @@ class PdfCanvas(QAbstractScrollArea):
             return
         x, y = self._to_page(pg, pos)
         tool = self.tool
+        if tool == "hand":
+            # Hand tool: dragging ALWAYS pans (even over text). A plain click still follows
+            # links and opens notes / comments.
+            self.clear_selection()
+            a = self._annot_at(pg, x, y)
+            link = self._link_at(pg, x, y)
+            if a is not None and a.kind in (A_TEXT, *MARKUP):
+                self._pending_click = {"type": "annot", "pg": pg, "xref": a.xref, "kind": a.kind}
+            elif link:
+                self._pending_click = {"type": "link", "link": link}
+            self._begin_pan(pos)
+            return
         if tool == "note":
             self._add_note_at(pg, x, y)
             return
@@ -1355,21 +1541,27 @@ class PdfCanvas(QAbstractScrollArea):
         self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def _grab_preview(self, pg: int, xref: int):
-        a = self._find(pg, xref)
-        if not a:
+        """Image to drag around: the stamp's own (upright) image, else a crop of what is on screen.
+        (PyMuPDF's annotation-only render is wrong on rotated pages.)"""
+        info = self._annot_info(pg, xref)
+        if info is None:
             return None
-        rs = self.s * self.devicePixelRatioF()
+        img = self._stamp_imgs.get(xref)
+        if img is not None and info.kind == A_STAMP:
+            return img
         try:
-            pix = a.get_pixmap(matrix=pymupdf.Matrix(rs, rs), alpha=True)
-            img = qimage_from_pix(pix, QImage.Format.Format_RGBA8888)
-            return img.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+            pm = self._pixmap(pg)
+            rs = self._render_scale(pg)
+            r = info.rect
+            crop = pm.copy(QRect(int(r.x0 * rs), int(r.y0 * rs), max(1, int(r.width * rs)), max(1, int(r.height * rs))))
+            return crop.toImage().convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
         except Exception:
             return None
 
     def _begin_move(self, pg: int, a: AInfo):
         self._drag = {"kind": "move", "pg": pg, "xref": a.xref, "orig": pymupdf.Rect(a.rect),
                       "rect": pymupdf.Rect(a.rect), "stamp": a.kind == A_STAMP, "started": False,
-                      "note": a.kind == A_TEXT}
+                      "note": a.kind == A_TEXT, "p0": self._to_page(pg, self._press_pos)}
 
     def _begin_resize(self, handle: str):
         pg, xref = self.sel_annot
@@ -1403,19 +1595,35 @@ class PdfCanvas(QAbstractScrollArea):
             if self.tool == "sign":
                 self.viewport().update()
             return
+        self._last_mouse = pos
         if not self._moved:
             if (pos - self._press_pos).manhattanLength() < 4:
                 return
             self._moved = True
-        kind = d["kind"]
-        if kind == "pan":
+        if d["kind"] == "pan":
             self.horizontalScrollBar().setValue(d["h"] - (pos.x() - d["pos"].x()))
             self.verticalScrollBar().setValue(d["v"] - (pos.y() - d["pos"].y()))
             return
-        pg = d["pg"]
+        self._update_drag(pos)
+        self._maybe_autoscroll(pos)
+
+    def _update_drag(self, pos):
+        d = self._drag
+        if d is None or d["kind"] == "pan":
+            return
+        kind, pg = d["kind"], d["pg"]
         x, y = self._to_page(pg, pos)
         if kind == "select":
-            wi = self._word_nearest(pg, x, y)
+            words = self._get_words(pg)
+            if not words:
+                return
+            ph = self.page_rects[pg].height
+            if y > ph + 2:                  # dragged below the page: select to its end
+                wi = len(words) - 1
+            elif y < -2:                    # above the page: select from its start
+                wi = 0
+            else:
+                wi = self._word_nearest(pg, x, y)
             if wi is not None:
                 a, b = sorted((d["start"], wi))
                 self.sel_words = (pg, a, b)
@@ -1424,7 +1632,7 @@ class PdfCanvas(QAbstractScrollArea):
             d["rect"] = pymupdf.Rect(min(d["x"], x), min(d["y"], y), max(d["x"], x), max(d["y"], y))
         elif kind == "move":
             self._start_hidden_preview(d)
-            dx, dy = (pos.x() - self._press_pos.x()) / self.s, (pos.y() - self._press_pos.y()) / self.s
+            dx, dy = x - d["p0"][0], y - d["p0"][1]
             o = d["orig"]
             d["rect"] = self._clamp_rect(pg, pymupdf.Rect(o.x0 + dx, o.y0 + dy, o.x1 + dx, o.y1 + dy))
         elif kind == "resize":
@@ -1434,16 +1642,50 @@ class PdfCanvas(QAbstractScrollArea):
             hname = d["handle"]
             fx = o.x1 if "l" in hname else o.x0
             fy = o.y1 if "t" in hname else o.y0
-            w = max(12.0, abs(x - fx))
+            pr = self.page_rects[pg]
+            max_w = fx if "l" in hname else pr.width - fx                    # stay inside the page
+            max_h = fy if "t" in hname else pr.height - fy
+            w_cap = max(1.0, min(max_w, max_h / max(ar, 1e-6)))
+            w = min(max(12.0, abs(x - fx)), w_cap)
             h = w * ar
             x0, x1 = (fx - w, fx) if "l" in hname else (fx, fx + w)
             y0, y1 = (fy - h, fy) if "t" in hname else (fy, fy + h)
             d["rect"] = pymupdf.Rect(x0, y0, x1, y1)
         self.viewport().update()
 
+    def _maybe_autoscroll(self, pos):
+        d = self._drag
+        vh = self.viewport().height()
+        if d and d["kind"] in ("select", "area", "move", "resize") and (pos.y() < 24 or pos.y() > vh - 24):
+            if not self._autoscroll_timer.isActive():
+                self._autoscroll_timer.start()
+        else:
+            self._autoscroll_timer.stop()
+
+    def _autoscroll_step(self):
+        d = self._drag
+        pos = self._last_mouse
+        vh = self.viewport().height()
+        if d is None or d["kind"] == "pan":
+            self._autoscroll_timer.stop()
+            return
+        if pos.y() < 24:
+            dy = -min(70, (24 - pos.y()) // 2 + 6)
+        elif pos.y() > vh - 24:
+            dy = min(70, (pos.y() - (vh - 24)) // 2 + 6)
+        else:
+            self._autoscroll_timer.stop()
+            return
+        vb = self.verticalScrollBar()
+        vb.setValue(vb.value() + dy)
+        self._update_drag(pos)
+
     def mouseReleaseEvent(self, ev):
         d = self._drag
+        if d is not None and ev.button() != self._drag_btn:
+            return                          # some other button was released: the drag goes on
         self._drag = None
+        self._autoscroll_timer.stop()
         self._update_cursor(ev.position().toPoint())
         if d is None:
             return
@@ -1468,7 +1710,10 @@ class PdfCanvas(QAbstractScrollArea):
             elif not self._moved:
                 self.clear_selection()
         elif kind == "pan" and not self._moved:
-            self.clear_selection()
+            if self._pending_click is not None:
+                self._click_action(ev)
+            else:
+                self.clear_selection()
         self.viewport().update()
 
     def _click_action(self, ev):
@@ -1481,7 +1726,11 @@ class PdfCanvas(QAbstractScrollArea):
         if pc["type"] == "link":
             self._follow_link(pc["link"])
         elif pc["type"] == "annot":
-            self._open_comment(pc["pg"], pc["xref"])
+            if pc.get("kind") == A_TEXT:
+                info = self._annot_info(pc["pg"], pc["xref"])
+                self._open_note_editor(pc["pg"], pc["xref"], info.content if info else "")
+            else:
+                self._open_comment(pc["pg"], pc["xref"])
 
     def _finish_move(self, d):
         pg, xref = d["pg"], d["xref"]
@@ -1494,18 +1743,19 @@ class PdfCanvas(QAbstractScrollArea):
         old, new = pymupdf.Rect(d["orig"]), pymupdf.Rect(d["rect"])
         a = self._find(pg, xref)
         if a:
-            a.set_flags(a.flags & ~HIDDEN)
-            a.set_rect(new)
+            if (pg, xref) not in self.trashed:
+                a.set_flags(a.flags & ~HIDDEN)
+            a.set_rect(self._unrot_rect(pg, new))
 
         def setr(r):
             b = self._find(pg, xref)
             if b:
-                b.set_rect(r)
+                b.set_rect(self._unrot_rect(pg, r))
         self._push(lambda: setr(old), lambda: setr(new), [pg])
         self.viewport().update()
 
     def mouseDoubleClickEvent(self, ev):
-        if not self.doc or ev.button() != Qt.MouseButton.LeftButton:
+        if not self.doc or ev.button() != Qt.MouseButton.LeftButton or self.tool != "select":
             return
         pos = ev.position().toPoint()
         pg = self._page_at(pos)
@@ -1527,20 +1777,45 @@ class PdfCanvas(QAbstractScrollArea):
 
     def _edit_text_stamp(self, pg: int, a: AInfo):
         parts = a.subject.split("|")
+        opts = dict(self.text_opts)          # edit with the stamp's own size/colour, leave the toolbar settings alone
         try:
-            self.text_opts["size"] = float(parts[1])
-            self.text_opts["color"] = tuple(int(v) for v in parts[2].split(","))
+            opts["size"] = float(parts[1])
+            opts["color"] = tuple(int(v) for v in parts[2].split(","))
         except Exception:
             pass
-        self._begin_text_input(pg, a.rect.x0, a.rect.y0, text=a.content, replace_xref=a.xref)
+        self._begin_text_input(pg, a.rect.x0, a.rect.y0, text=a.content, replace_xref=a.xref, opts=opts)
 
     def _follow_link(self, link):
         kind = link.get("kind")
         if kind == pymupdf.LINK_GOTO:
-            to = link.get("to")
-            self.goto_page(link.get("page", 0), to.y if to else 0)
+            pno = link.get("page", -1)
+            if not (0 <= pno < self.page_count):
+                return
+            to, y = link.get("to"), 0.0
+            if to is not None:
+                try:
+                    pg = self._page(pno)
+                    y = (pymupdf.Point(to) * pg.rotation_matrix).y if pg.rotation else to.y
+                except Exception:
+                    y = 0.0
+            self.goto_page(pno, y)
         elif kind == pymupdf.LINK_URI:
-            QDesktopServices.openUrl(QUrl(link.get("uri", "")))
+            uri = (link.get("uri") or "").strip()
+            # A PDF is untrusted input: never hand file:, javascript:, ms-... etc. to the OS.
+            if uri.lower().startswith(("http://", "https://", "mailto:")):
+                QDesktopServices.openUrl(QUrl(uri))
+            else:
+                self.statusMessage.emit(T("link_blocked"))
+        elif kind == pymupdf.LINK_NAMED:
+            name = (link.get("name") or "").lower()
+            if name == "nextpage":
+                self.goto_page(self._cur_page + 1)
+            elif name == "prevpage":
+                self.goto_page(self._cur_page - 1)
+            elif name == "firstpage":
+                self.goto_page(0)
+            elif name == "lastpage":
+                self.goto_page(self.page_count - 1)
 
     def leaveEvent(self, ev):
         self._hover = None
@@ -1581,19 +1856,13 @@ class PdfCanvas(QAbstractScrollArea):
         if k in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self.sel_annot:
             self.delete_selected()
         elif k == Qt.Key.Key_Escape:
-            if self._drag and self._drag["kind"] in ("move", "resize") and self._drag.get("started"):
-                d = self._drag
-                self._drag = None
-                a = self._find(d["pg"], d["xref"])
-                if a:
-                    a.set_flags(a.flags & ~HIDDEN)
-                self._invalidate([d["pg"]])
-            self._drag = None
+            self.cancel_drag()
             self.clear_selection()
             self.toolShortcut.emit("select")
         elif ctrl and k == Qt.Key.Key_C:
             self.copy_selection()
-        elif k in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down) and self.sel_annot:
+        elif (k in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down)
+              and self._sel_movable()):
             self._nudge(k, 10.0 if mods & Qt.KeyboardModifier.ShiftModifier else 1.0)
         elif k == Qt.Key.Key_Down:
             self.smooth_scroll_by(80)
@@ -1611,12 +1880,20 @@ class PdfCanvas(QAbstractScrollArea):
             self.goto_page(0)
         elif k == Qt.Key.Key_End and self.doc:
             self.goto_page(self.page_count - 1)
-        elif not ctrl and k in (Qt.Key.Key_V, Qt.Key.Key_H, Qt.Key.Key_N, Qt.Key.Key_T, Qt.Key.Key_S):
+        elif not ctrl and k in (Qt.Key.Key_V, Qt.Key.Key_H, Qt.Key.Key_N, Qt.Key.Key_T, Qt.Key.Key_S,
+                                Qt.Key.Key_P):
             self.toolShortcut.emit({Qt.Key.Key_V: "select", Qt.Key.Key_H: "highlight",
+                                    Qt.Key.Key_P: "hand",
                                     Qt.Key.Key_N: "note", Qt.Key.Key_T: "text",
                                     Qt.Key.Key_S: "sign"}[k])
         else:
             super().keyPressEvent(ev)
+
+    def _sel_movable(self) -> bool:
+        if not self.sel_annot:
+            return False
+        a = self._annot_info(*self.sel_annot)
+        return bool(a) and a.kind in (A_STAMP, A_TEXT)
 
     def _nudge(self, key, step):
         pg, xref = self.sel_annot
@@ -1631,7 +1908,7 @@ class PdfCanvas(QAbstractScrollArea):
         def setr(r):
             b = self._find(pg, xref)
             if b:
-                b.set_rect(r)
+                b.set_rect(self._unrot_rect(pg, r))
         setr(new)
         self._push(lambda: setr(old), lambda: setr(new), [pg])
 
@@ -1642,6 +1919,13 @@ class PdfCanvas(QAbstractScrollArea):
         pos = ev.pos()
         pg = self._page_at(pos)
         m = QMenu(self)
+        if self.sel_words:
+            inside = False
+            if pg >= 0 and pg == self.sel_words[0]:
+                cx, cy = self._to_page(pg, pos)
+                inside = any(r.x0 <= cx <= r.x1 and r.y0 <= cy <= r.y1 for r in self._selection_rects(*self.sel_words))
+            if not inside:
+                self.clear_selection()      # right-click elsewhere: the old selection is not what the user means
         if self.sel_words:
             m.addAction(T("copy"), self.copy_selection)
             m.addSeparator()

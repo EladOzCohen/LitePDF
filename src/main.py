@@ -25,7 +25,7 @@ def _install_crash_handler():
             pass
         try:
             from PySide6.QtWidgets import QMessageBox
-            QMessageBox.critical(None, "LitePDF", "Unexpected error (details in %APPDATA%\\LitePDF\\crash.log):\n\n"
+            QMessageBox.critical(None, "LitePDF", "שגיאה לא צפויה / Unexpected error\n(%APPDATA%\\LitePDF\\crash.log)\n\n"
                                  + str(value))
         except Exception:
             pass

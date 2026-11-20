@@ -12,7 +12,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QPointF, QRectF, QSize, Signal
 from PySide6.QtGui import (QImage, QPainter, QPainterPath, QPen, QColor, QFontDatabase, QFont,
-                           QPixmap)
+                           QPixmap, QRawFont, QIcon)
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget, QPushButton,
                                QLineEdit, QListWidget, QListWidgetItem, QLabel, QButtonGroup,
                                QRadioButton, QSlider, QDialogButtonBox)
@@ -22,7 +22,7 @@ from textrender import render_text, image_to_png
 
 HANDWRITING_FONTS = ["Segoe Script", "Ink Free", "Lucida Handwriting", "Brush Script MT",
                      "Freestyle Script", "Mistral", "Gabriola", "Segoe Print", "Bradley Hand ITC",
-                     "Kristen ITC", "Monotype Corsiva", "Arial"]
+                     "Kristen ITC", "Monotype Corsiva", "Arial", "David", "Gisha", "Miriam", "Narkisim", "Segoe UI"]
 INK_COLORS = [("ink_black", (0.05, 0.05, 0.08)), ("ink_blue", (0.05, 0.12, 0.62))]
 
 
@@ -67,7 +67,7 @@ class DrawPad(QWidget):
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.strokes: list[list[QPointF]] = []
         self.color = INK_COLORS[0][1]
-        self.width = 3.2
+        self.pen_w = 3.2
         self._drawing = False
 
     def set_color(self, c):
@@ -75,7 +75,7 @@ class DrawPad(QWidget):
         self.update()
 
     def set_width(self, w: float):
-        self.width = w
+        self.pen_w = w
         self.update()
 
     def clear(self):
@@ -120,13 +120,13 @@ class DrawPad(QWidget):
 
     def _paint_strokes(self, p: QPainter, scale=1.0):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(QColor.fromRgbF(*self.color), self.width * scale, Qt.PenStyle.SolidLine,
+        pen = QPen(QColor.fromRgbF(*self.color), self.pen_w * scale, Qt.PenStyle.SolidLine,
                    Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
         for pts in self.strokes:
             if len(pts) == 1:
                 p.setBrush(QColor.fromRgbF(*self.color))
-                r = self.width * scale / 2
+                r = self.pen_w * scale / 2
                 c = pts[0] * scale
                 p.drawEllipse(c, r, r)
                 p.setBrush(Qt.BrushStyle.NoBrush)
@@ -134,7 +134,7 @@ class DrawPad(QWidget):
                 p.save()
                 p.scale(scale, scale)
                 pen2 = QPen(pen)
-                pen2.setWidthF(self.width)
+                pen2.setWidthF(self.pen_w)
                 p.setPen(pen2)
                 p.drawPath(self._path(pts))
                 p.restore()
@@ -157,10 +157,10 @@ class DrawPad(QWidget):
     def image(self) -> QImage | None:
         if not self.strokes:
             return None
-        pad = self.width * 2 + 4
+        pad = self.pen_w * 2 + 4
         xs = [pt.x() for s in self.strokes for pt in s]
         ys = [pt.y() for s in self.strokes for pt in s]
-        x0, x1 = max(0, min(xs) - pad), min(self.width_px(), max(xs) + pad)
+        x0, x1 = max(0, min(xs) - pad), min(self.width(), max(xs) + pad)
         y0, y1 = max(0, min(ys) - pad), min(self.height(), max(ys) + pad)
         sc = 3.0
         img = QImage(max(2, math.ceil((x1 - x0) * sc)), max(2, math.ceil((y1 - y0) * sc)),
@@ -171,9 +171,6 @@ class DrawPad(QWidget):
         self._paint_strokes(p, sc)
         p.end()
         return img
-
-    def width_px(self) -> int:
-        return super().width()
 
 
 class TypePad(QWidget):
@@ -212,13 +209,31 @@ class TypePad(QWidget):
         it = self.fonts.currentItem()
         return it.data(Qt.ItemDataRole.UserRole) if it else "Arial"
 
+    @staticmethod
+    def _has_hebrew(text: str) -> bool:
+        return any("֐" <= ch <= "׿" for ch in text)
+
     def _refresh(self, *_):
+        name = self.edit.text().strip()
+        need_he = self._has_hebrew(name)
+        first_visible = None
         for i in range(self.fonts.count()):
             it = self.fonts.item(i)
-            f = QFont(it.data(Qt.ItemDataRole.UserRole))
+            fam = it.data(Qt.ItemDataRole.UserRole)
+            f = QFont(fam)
             f.setPointSize(15)
             it.setFont(f)
-            it.setText(self.edit.text().strip() or it.data(Qt.ItemDataRole.UserRole))
+            it.setText(name or fam)
+            # Hebrew name: only list fonts that really have Hebrew glyphs (others silently fall back)
+            ok = (not need_he) or QRawFont.fromFont(f).supportsCharacter(0x05D0)   # real glyph, not a fallback
+            it.setHidden(not ok)
+            if ok and first_visible is None:
+                first_visible = i
+        cur = self.fonts.currentItem()
+        if first_visible is not None and (cur is None or cur.isHidden()):
+            self.fonts.blockSignals(True)
+            self.fonts.setCurrentRow(first_visible)
+            self.fonts.blockSignals(False)
         img = self.image()
         if img is None:
             self.preview.clear()
@@ -272,6 +287,9 @@ class SignatureDialog(QDialog):
         self.group = QButtonGroup(self)
         for i, (key, col) in enumerate(INK_COLORS):
             rb = QRadioButton(T(key))
+            sw = QPixmap(18, 18)
+            sw.fill(QColor.fromRgbF(*col))
+            rb.setIcon(QIcon(sw))          # visible swatch even when the dark theme hides dark text
             rb.setChecked(i == 0)
             rb.toggled.connect(lambda on, c=col: on and self._set_color(c))
             self.group.addButton(rb)

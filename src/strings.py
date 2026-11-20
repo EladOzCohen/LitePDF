@@ -43,6 +43,9 @@ S.update({
     "help": ("עזרה", "Help"),
     "about": ("אודות", "About"),
 
+    "tool_hand": ("יד (גלילה)", "Hand (pan)"),
+    "hint_hand": ("גררו כדי להזיז את הדף (גם מעל טקסט) · קליק על פתק/קישור פותח אותו",
+                  "Drag to move the page (even over text) · click a note/link to open it"),
     "tool_select": ("בחירה", "Select"),
     "tool_highlight": ("מרקר", "Highlight"),
     "tool_underline": ("קו תחתי", "Underline"),
@@ -126,9 +129,16 @@ S.update({
     "discard": ("לא לשמור", "Discard"),
     "overwrite_q": ("לשמור את השינויים בתוך הקובץ המקורי \"{0}\"?\n(אפשר גם לשמור עותק חדש ולהשאיר את המקור כמו שהוא.)",
                     "Save the changes into the original file \"{0}\"?\n(Or save a new copy and leave the original untouched.)"),
-    "overwrite": ("שמירה על המקור", "Overwrite original"),
+    "overwrite": ("דריסת הקובץ המקורי", "Overwrite original"),
     "save_copy": ("שמירת עותק חדש…", "Save a new copy…"),
     "copy_suffix": ("_ערוך", "_edited"),
+    "rotate_partial": ("{0} עמודים לא ניתנים לסיבוב (קובץ פגום)", "{0} pages could not be rotated (damaged file)"),
+    "link_blocked": ("הקישור נחסם: מותר לפתוח רק קישורי אינטרנט ודואר אלקטרוני", "Link blocked: only web and e-mail links are opened"),
+    "not_pdf": ("\"{0}\" אינו קובץ PDF. התוכנה פותחת ושומרת רק קבצי PDF.", "\"{0}\" is not a PDF file. LitePDF opens and saves PDF files only."),
+    "undo_cleared": ("(היסטוריית הביטול אופסה)", "(undo history cleared)"),
+    "signed_warn": ("בקובץ יש חתימה דיגיטלית. שמירה בצורה הזאת (עותק חדש או כתיבה מחדש של הקובץ) תפסול אותה.\nלהמשיך?",
+                    "This file has a digital signature. Saving this way (a copy, or rewriting the file) will invalidate it.\nContinue?"),
+    "replace_q": ("הקובץ \"{0}\" כבר קיים. להחליף אותו?", "\"{0}\" already exists. Replace it?"),
     "nothing_to_save": ("אין שינויים לשמירה", "Nothing to save"),
     "saved_to": ("נשמר: {0}", "Saved: {0}"),
     "save_failed": ("השמירה נכשלה:\n{0}\n\nייתכן שהקובץ פתוח בתוכנה אחרת.",
@@ -147,7 +157,7 @@ S.update({
         "• חתימה: בחרו \"חתימה\" > \"חתימה חדשה\" (ציור או הקלדה). החתימה נשמרת ואפשר להניח אותה בלחיצה, "
         "לגרור ולשנות גודל.\n"
         "• Delete מוחק את הפריט שנבחר · Ctrl+Z מבטל · Ctrl+F חיפוש · Ctrl+P הדפסה · Ctrl+S שמירה.\n"
-        "• מקשים: V בחירה · H מרקר · N פתק · T טקסט · S חתימה.\n"
+        "• מקשים: P יד (גלילה) · V בחירה · H מרקר · N פתק · T טקסט · S חתימה · F3 חיפוש הבא · F4 חלונית צד · Ctrl+Y שחזור · Ctrl+Shift+S שמירה בשם.\n"
         "• כל ההערות, הסימונים והחתימות נשמרים בתוך קובץ ה-PDF עצמו.",
         "• Select text: drag over it, then click Highlight or right-click.\n"
         "• Highlight: choose Highlight and drag over text (arrow next to it = colors).\n"
@@ -155,7 +165,7 @@ S.update({
         "• Text on page: for filling forms (name, date, check mark). Double-click text to edit it.\n"
         "• Sign: choose Sign > New signature (draw or type). It is saved; click to place it, then drag / resize.\n"
         "• Delete removes the selected item · Ctrl+Z undo · Ctrl+F search · Ctrl+P print · Ctrl+S save.\n"
-        "• Keys: V select · H highlight · N note · T text · S sign.\n"
+        "• Keys: P hand (pan) · V select · H highlight · N note · T text · S sign · F3 next result · F4 side panel · Ctrl+Y redo · Ctrl+Shift+S save as.\n"
         "• All comments, markups and signatures are stored inside the PDF file itself."),
     "about_text": ("{0} — קורא PDF קל ומהיר עם הערות בעברית, סימון, חתימה והדפסה.",
                    "{0} — a light and fast PDF reader with Hebrew notes, highlighting, signing and printing."),

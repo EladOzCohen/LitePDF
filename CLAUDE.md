@@ -57,6 +57,30 @@ Windows blocks silent default-app changes: the user must pick LitePDF once in Se
   mouse bugs on real PDFs; `tests/real_pdf_drag.py` checks selection counts on real documents.
 - Tests need a scratch dir argument that exists (use `mktemp -d`).
 
+## Session 4 — full QA audit (4 parallel reviewers + corpus run on ~1,850 of the user's PDFs + fuzzing)
+Hand tool added (P): drag always pans, even over text; click still opens notes/links.
+Fixed (each has a regression test in `tests/qa_regression_test.py` / `qa_rotation_test.py` / `signature_ui_test.py`):
+- **Signature dialog crashed on open** (`DrawPad.width` attribute shadowed `QWidget.width()`) and the **Sign dropdown was empty**
+  (`QMenu.setIconSize` doesn't exist) -> signing was completely broken. Now `pen_w`, and `QWidgetAction` previews.
+- **Rotated pages** (/Rotate, or the Rotate button): PyMuPDF gives words/annots/links/search hits in the UNROTATED frame; canvas now converts at the
+  boundary (`_vis_rect`, `_unrot_rect`, `_unrot_quad`, `_unrot_point`). Stamps are pre-rotated by -rot so they look upright; note icons are NoRotate
+  (pinned top-left corner -> map the POINT, not the rect). Quads keep visual corner order. Verified on pixels of the saved PDF.
+- **Save path** (`MainWindow._write`): never loses work. Live doc stays open+dirty on any failure; full rewrite only to temp then `os.replace`
+  (with retries; releases cached Page objects first); if replace fails we continue from the temp copy in memory (such a doc claims
+  `can_save_incrementally()` but can't -> also require a real file). Deleted notes/signatures force a full rewrite (privacy: otherwise old bytes
+  stay in the incremental revision). Signed PDFs: warn before a rewrite. Stamp image streams are compressed after creation (+130 KB -> +5 KB).
+  Popups/drags are committed/cancelled (`canvas.commit_pending()`) before save/open/close/print/language switch.
+- Undo/dirty: dirty = undo-stack top != top at last save (undo back to saved state = clean). Delete/undo during a stamp drag cancels the drag.
+- Selection/UX: right-click elsewhere drops stale text selection; arrows only nudge stamps/notes; resize clamped to page; autoscroll while
+  selecting; drag into next page selects to end of page; only the button that started a drag can end it; hand tool never resizes/selects;
+  window resize keeps the page; links: only http/https/mailto are opened (PDFs are untrusted); search ignores NUL/whitespace, merges
+  split hits only when boxes > real occurrences; popups close when their anchor scrolls away; huge text/size bounded (was 27 s).
+- UI: Esc closes search, F3 reopens the bar, zoom box rejects junk, focus returns to page after Enter in spin/zoom, language menu exclusive,
+  text preset no longer sticks, thumbnails rebuild after rotate/invert, notes list relayouts, min width 900, strings fixed.
+Corpus findings that are NOT app bugs: PDFs with broken font encodings (garbage text, search can't match), 0-page/corrupt files (app shows a message).
+Testing lessons: assert geometry on rendered pixels; PySide `QMenu.exec` can't be monkeypatched (use a fake menu class in the canvas module);
+PyMuPDF `Rect |=` has no in-place union; scratch dirs for tests must exist.
+
 ## Not done / ideas
 - Not verified: how Adobe displays Hebrew inside *its* sticky-note popup (user may see LTR alignment there; our own editor is correct). Interactive print dialog with a physical printer not tried (render pipeline tested via PDF output).
 - AcroForm widgets (real form fields) are displayed but not fillable — use the Text tool.

@@ -25,6 +25,9 @@ PATHS = {
     "sidebar": '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>',
     "menu": '<path d="M4 6h16M4 12h16M4 18h16"/>',
     "select": '<path d="M5 3l14 7-6.5 2L10 19z"/>',
+    "hand": '<path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V11"/><path d="M11 10.5V4a1.5 1.5 0 0 1 3 0v7"/>'
+            '<path d="M14 10.5V5.5a1.5 1.5 0 0 1 3 0V13"/>'
+            '<path d="M17 9a1.5 1.5 0 0 1 3 0v5.5a7 7 0 0 1-7 7h-1.5a6 6 0 0 1-4.6-2.1L4.2 15.2a1.6 1.6 0 0 1 2.4-2.1L8 14.5"/>',
     "highlight": '<path d="M15 4l5 5-9 9H7l-2-2v-3z"/><path d="M4 21h8" stroke-width="3"/>',
     "underline": '<path d="M7 4v7a5 5 0 0 0 10 0V4"/><path d="M5 21h14"/>',
     "strike": '<path d="M16.5 7.5C16 5.5 14.3 4.5 12 4.5c-2.5 0-4.2 1.2-4.2 3 0 1.6 1.2 2.3 4.2 3"/>'

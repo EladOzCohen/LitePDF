@@ -2,7 +2,7 @@
 import unicodedata
 
 from PySide6.QtCore import Qt, QSize, QRect
-from PySide6.QtGui import QTextDocument, QPalette, QAbstractTextDocumentLayout, QFont
+from PySide6.QtGui import QTextDocument, QPalette, QAbstractTextDocumentLayout, QFont, QColor
 from PySide6.QtWidgets import QStyledItemDelegate, QStyle, QStyleOptionViewItem
 
 from textrender import auto_direction_option
@@ -64,7 +64,7 @@ class NoteDelegate(QStyledItemDelegate):
         r = opt.rect
         painter.save()
         head = index.data(HEAD_ROLE) or ""
-        hc = color
+        hc = QColor(color)             # a copy: setAlpha on the alias would dim the note text as well
         hc.setAlpha(150)
         painter.setPen(hc)
         painter.drawText(QRect(r.left() + self.PAD, r.top() + self.PAD // 2, r.width() - 2 * self.PAD, fm.height()),
