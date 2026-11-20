@@ -88,7 +88,8 @@ Build: `powershell -File toolsuild_installer.ps1 [-Rebuild]` (builds the exe if
   listing loaded DLLs (0 outside the app folder / Windows). So the installer installs NO Python/libraries; it only enforces Windows 10 1809+ x64 (`MinVersion`, `ArchitecturesAllowed`).
   build_exe.ps1 excludes pandas/jedi/zmq/IPython/... (they sneaked in from the global Python): bundle 145 -> 114 MB.
 - Per-user (`PrivilegesRequired=lowest`, HKA = HKCU, {autopf} = %LOCALAPPDATA%\Programs), no UAC. `PrivilegesRequiredOverridesAllowed=commandline` lets IT use `/ALLUSERS`.
-- English + Hebrew wizard (RTL) picked from the Windows UI language; tasks: desktop icon, "Open with" registration (same keys as toolsegister_default_app.ps1;
+- English + Hebrew wizard (RTL) picked from the Windows UI language; tasks: desktop icon, "Open with" registration (same keys as tools
+egister_default_app.ps1;
   all removed on uninstall); finish page: launch app / open Windows Default-apps page. Uninstall asks whether to also delete %APPDATA%\LitePDF (signatures, settings); default = keep.
 - Fixed AppId GUID => installing a newer version upgrades in place (Restart Manager closes a running LitePDF, which asks to save). Unsigned => SmartScreen warning on first run.
 - Testing without touching the real setup: compile a variant with `/DAppName="LitePDF Test" /DAppExe=LitePDFTest.exe /DProgId=LitePDFTest.Document /DCapKey=...LitePDFTest... /DRegAppName=LitePDFTest /DAppId={{<other guid>}`
